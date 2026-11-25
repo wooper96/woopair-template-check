@@ -1,0 +1,88 @@
+name: Publish WooPair website
+
+on:
+  push:
+    # Every new head must queue a run, including edits outside the published site.
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+  pages: write
+
+concurrency:
+  # Serialize deploys with earlier versions of this template during an upgrade.
+  group: pokepairings-pages
+  cancel-in-progress: false
+  # A rerun of an older commit must not displace a newer pending deploy.
+  queue: max
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      PAGES_ARTIFACT_NAME: github-pages-${{ github.run_attempt }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Skip outdated runs before preparing the site
+        id: freshness
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          if [ "$head" = "$GITHUB_SHA" ]; then
+            echo 'current=true' >> "$GITHUB_OUTPUT"
+          else
+            echo '::notice::A newer commit replaced this deployment.'
+          fi
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        if: steps.freshness.outputs.current == 'true'
+        with:
+          persist-credentials: false
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+        if: steps.freshness.outputs.current == 'true'
+      - name: Package website and tournament data
+        if: steps.freshness.outputs.current == 'true'
+        run: python3 .github/scripts/package-pages.py "$RUNNER_TEMP/league-site"
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        id: upload
+        if: steps.freshness.outputs.current == 'true'
+        with:
+          name: ${{ env.PAGES_ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/league-site
+      - name: Verify Pages source and current commit
+        id: eligibility
+        if: steps.freshness.outputs.current == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo '::notice::A newer commit replaced this deployment.'
+            exit 0
+          fi
+          mode=$(gh api "repos/$GITHUB_REPOSITORY/pages" --jq '.build_type')
+          if [ "$mode" != 'workflow' ]; then
+            echo '::error::Set the GitHub Pages source to GitHub Actions before deploying.'
+            exit 1
+          fi
+          echo 'current=true' >> "$GITHUB_OUTPUT"
+      - name: Deploy website
+        if: steps.eligibility.outputs.current == 'true'
+        id: deployment
+        timeout-minutes: 11
+        uses: actions/github-script@d746ffe35508b1917358783b479e04febd2b8f71 # v9
+        env:
+          PAGES_ARTIFACT_ID: ${{ steps.upload.outputs.artifact_id }}
+        with:
+          script: |
+            const { deployPages } = require('./.github/scripts/deploy-pages.cjs');
+            const cancellation = new AbortController();
+            process.once('SIGINT', () => cancellation.abort());
+            process.once('SIGTERM', () => cancellation.abort());
+            await deployPages(github, context, core, process.env.PAGES_ARTIFACT_ID, { cancellation: cancellation.signal });
