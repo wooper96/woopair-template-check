@@ -27,7 +27,7 @@ jobs:
       PAGES_ARTIFACT_NAME: github-pages-${{ github.run_attempt }}
     environment:
       name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      url: ${{ steps.retry.outputs.page_url || steps.deployment.outputs.page_url }}
     steps:
       - name: Skip outdated runs before preparing the site
         id: freshness
@@ -81,8 +81,28 @@ jobs:
           PAGES_ARTIFACT_ID: ${{ steps.upload.outputs.artifact_id }}
         with:
           script: |
-            const { deployPages } = require('./.github/scripts/deploy-pages.cjs');
+            const { deployWithRecovery } = require('./.github/scripts/deploy-pages.cjs');
             const cancellation = new AbortController();
             process.once('SIGINT', () => cancellation.abort());
             process.once('SIGTERM', () => cancellation.abort());
-            await deployPages(github, context, core, process.env.PAGES_ARTIFACT_ID, { cancellation: cancellation.signal });
+            await deployWithRecovery(github, context, core, process.env.PAGES_ARTIFACT_ID, { cancellation: cancellation.signal });
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4
+        id: retry-upload
+        if: steps.deployment.outputs.retry == 'true'
+        with:
+          name: ${{ env.PAGES_ARTIFACT_NAME }}-retry
+          path: ${{ runner.temp }}/league-site
+      - name: Retry Pages deployment
+        if: steps.deployment.outputs.retry == 'true'
+        id: retry
+        timeout-minutes: 11
+        uses: actions/github-script@d746ffe35508b1917358783b479e04febd2b8f71 # v9
+        env:
+          PAGES_ARTIFACT_ID: ${{ steps.retry-upload.outputs.artifact_id }}
+        with:
+          script: |
+            const { retryPages } = require('./.github/scripts/deploy-pages.cjs');
+            const cancellation = new AbortController();
+            process.once('SIGINT', () => cancellation.abort());
+            process.once('SIGTERM', () => cancellation.abort());
+            await retryPages(github, context, core, process.env.PAGES_ARTIFACT_ID, { cancellation: cancellation.signal });

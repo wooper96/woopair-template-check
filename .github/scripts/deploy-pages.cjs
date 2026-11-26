@@ -2,11 +2,12 @@ const { setTimeout: sleep } = require("node:timers/promises");
 
 const deployments = "/repos/{owner}/{repo}/pages/deployments";
 const deployment = `${deployments}/{pages_deployment_id}`;
+const retryableDeploymentFailure = "deployment_failed";
 const pollIntervalMs = 5000;
 const terminalFailures = new Set([
   "deployment_cancelled",
   "deployment_content_failed",
-  "deployment_failed",
+  retryableDeploymentFailure,
   "deployment_lost",
   "deployment_perms_error",
 ]);
@@ -52,6 +53,7 @@ async function deployPages(github, context, core, uploadedId, {
     oidc_token: oidcToken,
   });
   const target = { ...context.repo, pages_deployment_id: created.id ?? context.sha };
+  core.info(`Pages deployment ${target.pages_deployment_id}, commit ${context.sha}, artifact ${artifactId}.`);
   const signal = AbortSignal.any([cancellation, AbortSignal.timeout(timeoutMs)]);
   let finished = false;
   let consecutiveErrors = 0;
@@ -84,7 +86,7 @@ async function deployPages(github, context, core, uploadedId, {
       }
       if (terminalFailures.has(status)) {
         finished = true;
-        throw new Error(`The Pages deployment ended with status: ${status}.`);
+        throw Object.assign(new Error(`The Pages deployment ended with status: ${status}.`), { pagesStatus: status });
       }
       await wait(pollIntervalMs, undefined, { signal });
     }
@@ -102,4 +104,38 @@ async function deployPages(github, context, core, uploadedId, {
   }
 }
 
-module.exports = { deployPages };
+async function deployWithRecovery(github, context, core, artifactId, options) {
+  try {
+    await deployPages(github, context, core, artifactId, options);
+  } catch (error) {
+    if (error.pagesStatus !== retryableDeploymentFailure) throw safeWorkflowError(error);
+    core.warning("Pages ended the first deployment with a failure. WooPair will try once more with a fresh upload.");
+    core.setOutput("retry", "true");
+  }
+}
+
+async function retryPages(github, context, core, artifactId, options) {
+  try {
+    const { repo } = context;
+    const { data: pages } = await github.request("GET /repos/{owner}/{repo}/pages", repo);
+    if (pages.build_type !== "workflow") throw new Error("Select GitHub Actions as the Pages source before retrying.");
+    const { data: head } = await github.request("GET /repos/{owner}/{repo}/git/ref/heads/main", repo);
+    if (head.object.sha !== context.sha) {
+      core.info("A newer commit replaced this deployment.");
+      return;
+    }
+    await deployPages(github, context, core, artifactId, options);
+  } catch (error) {
+    throw safeWorkflowError(error);
+  }
+}
+
+function safeWorkflowError(error) {
+  if (!Number.isInteger(error.status)) return error;
+  const requestId = error.response?.headers?.["x-github-request-id"];
+  const request = typeof requestId === "string" && /^[A-F0-9:]{1,100}$/i.test(requestId) ? `, request ${requestId}` : "";
+  // Request errors can carry the deployment request body, including the OIDC token.
+  return new Error(`GitHub API request failed (HTTP ${error.status}${request}).`);
+}
+
+module.exports = { deployPages, deployWithRecovery, retryPages };
