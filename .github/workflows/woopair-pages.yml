@@ -5,6 +5,11 @@ on:
     # Every new head must queue a run, including edits outside the published site.
     branches: [main]
   workflow_dispatch:
+    inputs:
+      pilot_data:
+        description: Fictional tournament JSON for this disposable Pages deployment
+        required: false
+        type: string
 
 permissions:
   actions: read
@@ -46,6 +51,36 @@ jobs:
           persist-credentials: false
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
         if: steps.freshness.outputs.current == 'true'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: steps.freshness.outputs.current == 'true'
+        with:
+          node-version: 24
+          cache: npm
+      - name: Build the league website
+        if: steps.freshness.outputs.current == 'true'
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+      - name: Load disposable tournament examples
+        if: steps.freshness.outputs.current == 'true' && inputs.pilot_data != ''
+        env:
+          PILOT_DATA: ${{ inputs.pilot_data }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          from uuid import UUID
+          events = json.loads(os.environ["PILOT_DATA"])
+          assert isinstance(events, list) and len(events) <= 5
+          directory = Path("data/tournaments")
+          index = []
+          for event in events:
+              event_id = str(UUID(event["id"]))
+              assert event_id == event["id"] and event["schemaVersion"] == 1
+              index.append({key: event[key] for key in ("id", "revision", "displayName", "phase", "updatedAt", "eventDate")})
+              (directory / (event_id + ".json")).write_text(json.dumps(event) + "\n")
+          (directory / "index.json").write_text(json.dumps({"schemaVersion":1, "tournaments":index}) + "\n")
+          PYTHON
       - name: Package website and tournament data
         if: steps.freshness.outputs.current == 'true'
         run: python3 .github/scripts/package-pages.py "$RUNNER_TEMP/league-site"
